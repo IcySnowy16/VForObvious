@@ -21,6 +21,7 @@ from .models import (
     TASK_KIND_EXPERIMENT,
     TASK_KIND_TASK,
     new_goal,
+    new_insight,
     new_milestone,
     new_scope,
     new_skill,
@@ -56,6 +57,7 @@ HELP_TEXT = (
     "/ping - Health check\n"
     "/add_updates <text> - Log update requests\n"
     "/add_goal <name> [| desc] [| milestone1 50%, milestone2 80%]\n"
+    "/goal_to_milestones <goal_id|goal_name> | milestone1 50%, milestone2 80%\n"
     "/list_goals\n"
     "/add_skill <goal_id> <name> [| desc]\n"
     "/list_skills\n"
@@ -66,9 +68,13 @@ HELP_TEXT = (
     "/add_scope <milestone_id> <name> [| start=YYYY-MM-DD | end=YYYY-MM-DD]\n"
     "/list_scopes\n"
     "/add_task <scope_id> <name> [| kind=task|experiment | weight=2]\n"
-    "/list_tasks\n"
+    "/list_tasks [scope_id]\n"
     "/complete_task <task_id>\n"
+    "/complete_task <scope_id> | <task name or #index>\n"
     "/progress <goal|skill|stage|milestone|scope> <id>\n"
+    "/add_insight <text> [| tags=a,b | group=foo]\n"
+    "/list_insights [all|untagged|unsummarized|pending]\n"
+    "/update_insight <insight_id> [| text=... | summary=... | tags=a,b | group=...]\n"
     "/remind daily HH:MM\n"
     "/remind weekly <mon|tue|...|0-6> HH:MM\n"
     "/remind off\n"
@@ -81,8 +87,12 @@ HELP_TEXT = (
     "Examples:\n"
     "/add_goal Learn Japanese | Long term goal\n"
     "/add_goal Stress Management | Long term goal | Failure Mgmt 50%, Task Manager 80%\n"
+    "/goal_to_milestones Stress Management | Failure Mgmt 50%, Task Manager 80%\n"
     "/add_skill goal_123 Kana Recognition\n"
     "/add_task scope_123 Drill 10 mins | kind=task | weight=1\n"
+    "/list_tasks scope_123\n"
+    "/complete_task scope_123 | #2\n"
+    "/add_insight Daily review felt rushed | tags=process,energy | group=weekly\n"
     "/progress skill skill_123\n"
     "/remind daily 20:00\n"
     "/remind weekly mon 09:00\n"
@@ -166,6 +176,73 @@ async def cmd_add_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     save_db(db)
     suffix = f" (milestones: {len(created_milestones)})" if created_milestones else ""
     await update.message.reply_text(f"Goal added: {goal['id']} - {goal['name']}{suffix}")
+
+
+async def cmd_goal_to_milestones(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /goal_to_milestones <goal_id|goal_name> | milestone1 50%, milestone2 80%"
+        )
+        return
+
+    raw = " ".join(context.args)
+    parts = [part.strip() for part in raw.split("|") if part.strip()]
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "Please provide a goal and at least one milestone after '|'."
+        )
+        return
+
+    goal_ref = parts[0]
+    milestone_raw = " | ".join(parts[1:])
+    milestones = _parse_milestones_list(milestone_raw)
+    if not milestones:
+        await update.message.reply_text("Please provide milestones like Name 50%, Other 80%.")
+        return
+
+    db, user = _load_user(update)
+    goal_id, error = _resolve_goal_id(user, goal_ref)
+    if error:
+        await update.message.reply_text(error)
+        return
+
+    goal = user.get("goals", {}).get(goal_id)
+    if not goal:
+        await update.message.reply_text("Goal not found.")
+        return
+
+    skill, stage = _ensure_milestone_container(user, goal_id)
+
+    existing_names = set()
+    for milestone_id in stage.get("milestone_ids", []):
+        milestone = user.get("milestones", {}).get(milestone_id)
+        if isinstance(milestone, dict):
+            existing_names.add(_normalize_text(milestone.get("name", "")))
+
+    created = 0
+    for item in milestones:
+        name = item.get("name", "")
+        if not name:
+            continue
+        if _normalize_text(name) in existing_names:
+            continue
+        milestone = new_milestone(stage["id"], name, item.get("description", ""))
+        if item.get("target_percent") is not None:
+            milestone["target_percent"] = item["target_percent"]
+        user["milestones"][milestone["id"]] = milestone
+        stage.setdefault("milestone_ids", []).append(milestone["id"])
+        existing_names.add(_normalize_text(name))
+        created += 1
+
+    touch(skill)
+    touch(stage)
+    touch(goal)
+    touch(user)
+    save_db(db)
+
+    await update.message.reply_text(
+        f"Added {created} milestone(s) to goal {goal['name']} ({goal_id})."
+    )
 
 
 async def cmd_list_goals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -266,7 +343,7 @@ async def cmd_add_milestone(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def cmd_list_milestones(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _, user = _load_user(update)
-    msg = _format_items("Milestones", user.get("milestones", {}))
+    msg = _format_milestones_with_progress(user)
     await update.message.reply_text(msg)
 
 
@@ -338,27 +415,162 @@ async def cmd_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cmd_list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _, user = _load_user(update)
-    msg = _format_items("Tasks", user.get("tasks", {}), include_status=True)
+    if context.args:
+        scope_ref = " ".join(context.args).strip()
+        scope_id, error = _resolve_scope_id(user, scope_ref)
+        if error:
+            await update.message.reply_text(error)
+            return
+        msg = _format_tasks_for_scope(user, scope_id)
+    else:
+        msg = _format_tasks_grouped(user)
     await update.message.reply_text(msg)
 
 
 async def cmd_complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /complete_task <task_id>")
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /complete_task <task_id> OR /complete_task <scope_id> | <task name or #index>"
+        )
         return
 
-    task_id = context.args[0]
+    raw = " ".join(context.args).strip()
     db, user = _load_user(update)
+    task_id, error = _resolve_task_selector(user, raw)
+    if error:
+        await update.message.reply_text(error)
+        return
+
     task = user.get("tasks", {}).get(task_id)
     if not task:
         await update.message.reply_text("Task not found.")
+        return
+
+    if task.get("status") == STATUS_DONE:
+        await update.message.reply_text("Task already marked done.")
         return
 
     task["status"] = STATUS_DONE
     touch(task)
     touch(user)
     save_db(db)
-    await update.message.reply_text(f"Completed: {task_id}")
+
+    progress_msg = ""
+    milestone_percent = _milestone_progress_for_task(user, task)
+    if milestone_percent is not None:
+        progress_msg = f" (milestone {int(round(milestone_percent))}%)"
+
+    await update.message.reply_text(f"Completed: {task.get('name', task_id)}{progress_msg}")
+
+
+async def cmd_add_insight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /add_insight <text> [| tags=a,b | group=foo]")
+        return
+
+    text, kv = _parse_name_kv(" ".join(context.args))
+    if not text:
+        await update.message.reply_text("Please provide insight text.")
+        return
+
+    raw_tags = kv.get("tags") or kv.get("tag") or ""
+    tags = _parse_tags(raw_tags)
+    group = kv.get("group", "")
+    summary = kv.get("summary", "")
+
+    if _normalize_text(group) in RESET_WORDS or _normalize_text(group) in REMOVE_WORDS:
+        group = ""
+    if _normalize_text(summary) in RESET_WORDS or _normalize_text(summary) in REMOVE_WORDS:
+        summary = ""
+
+    db, user = _load_user(update)
+    insights = user.setdefault("insights", {})
+    insight = new_insight(text, tags=tags, group=group, summary=summary)
+    insights[insight["id"]] = insight
+    touch(user)
+    save_db(db)
+
+    await update.message.reply_text(f"Insight added: {insight['id']}")
+
+
+async def cmd_list_insights(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _, user = _load_user(update)
+    insights = user.get("insights", {})
+    if not insights:
+        await update.message.reply_text("Insights: (empty)")
+        return
+
+    mode = context.args[0].strip().lower() if context.args else "pending"
+    allowed = {"all", "untagged", "unsummarized", "pending"}
+    if mode not in allowed:
+        await update.message.reply_text(
+            "Usage: /list_insights [all|untagged|unsummarized|pending]"
+        )
+        return
+
+    items = _filter_insights(insights, mode)
+    if not items:
+        await update.message.reply_text(f"Insights ({mode}): (empty)")
+        return
+
+    msg = _format_insight_items(items, mode)
+    await update.message.reply_text(msg)
+
+
+async def cmd_update_insight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /update_insight <insight_id> [| text=... | summary=... | tags=a,b | group=...]"
+        )
+        return
+
+    insight_id, kv = _parse_name_kv(" ".join(context.args))
+    if not insight_id:
+        await update.message.reply_text("Please provide an insight id.")
+        return
+
+    db, user = _load_user(update)
+    insights = user.setdefault("insights", {})
+    insight = insights.get(insight_id)
+    if not isinstance(insight, dict):
+        await update.message.reply_text("Insight not found.")
+        return
+
+    updated: list[str] = []
+
+    if "text" in kv:
+        insight["text"] = kv["text"]
+        updated.append("text")
+
+    if "summary" in kv:
+        summary = kv["summary"]
+        if _normalize_text(summary) in RESET_WORDS or _normalize_text(summary) in REMOVE_WORDS:
+            insight["summary"] = ""
+        else:
+            insight["summary"] = summary
+        updated.append("summary")
+
+    raw_tags = kv.get("tags") or kv.get("tag")
+    if raw_tags is not None:
+        insight["tags"] = _parse_tags(raw_tags)
+        updated.append("tags")
+
+    if "group" in kv:
+        group = kv["group"]
+        if _normalize_text(group) in RESET_WORDS or _normalize_text(group) in REMOVE_WORDS:
+            insight["group"] = ""
+        else:
+            insight["group"] = group
+        updated.append("group")
+
+    if not updated:
+        await update.message.reply_text("No fields provided to update.")
+        return
+
+    touch(insight)
+    touch(user)
+    save_db(db)
+    await update.message.reply_text(f"Insight updated: {insight_id} ({', '.join(updated)})")
 
 
 async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -558,6 +770,7 @@ def build_application(token: str | None = None) -> Application:
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("add_updates", cmd_add_updates))
     app.add_handler(CommandHandler("add_goal", cmd_add_goal))
+    app.add_handler(CommandHandler("goal_to_milestones", cmd_goal_to_milestones))
     app.add_handler(CommandHandler("list_goals", cmd_list_goals))
     app.add_handler(CommandHandler("add_skill", cmd_add_skill))
     app.add_handler(CommandHandler("list_skills", cmd_list_skills))
@@ -571,6 +784,9 @@ def build_application(token: str | None = None) -> Application:
     app.add_handler(CommandHandler("list_tasks", cmd_list_tasks))
     app.add_handler(CommandHandler("complete_task", cmd_complete_task))
     app.add_handler(CommandHandler("progress", cmd_progress))
+    app.add_handler(CommandHandler("add_insight", cmd_add_insight))
+    app.add_handler(CommandHandler("list_insights", cmd_list_insights))
+    app.add_handler(CommandHandler("update_insight", cmd_update_insight))
     app.add_handler(CommandHandler("remind", cmd_remind))
     app.add_handler(milestone_flow)
     app.add_handler(CommandHandler("set_symbols", cmd_set_symbols))
@@ -880,6 +1096,311 @@ def _format_items(title: str, items: Dict[str, Any], include_status: bool = Fals
         suffix = f" ({status})" if status else ""
         lines.append(f"- {item_id}: {name}{suffix}")
     return "\n".join(lines)
+
+
+def _normalize_text(value: str) -> str:
+    return " ".join(str(value).strip().lower().split())
+
+
+def _resolve_goal_id(user: Dict[str, Any], raw: str) -> Tuple[str | None, str | None]:
+    goals = user.get("goals", {})
+    if raw in goals:
+        return raw, None
+    matches = [
+        goal_id
+        for goal_id, goal in goals.items()
+        if _normalize_text(goal.get("name", "")) == _normalize_text(raw)
+    ]
+    if len(matches) == 1:
+        return matches[0], None
+    if not matches:
+        return None, "Goal not found."
+    return None, "Multiple goals match that name. Use the goal id."
+
+
+def _resolve_scope_id(user: Dict[str, Any], raw: str) -> Tuple[str | None, str | None]:
+    scopes = user.get("scopes", {})
+    if raw in scopes:
+        return raw, None
+    matches = [
+        scope_id
+        for scope_id, scope in scopes.items()
+        if _normalize_text(scope.get("name", "")) == _normalize_text(raw)
+    ]
+    if len(matches) == 1:
+        return matches[0], None
+    if not matches:
+        return None, "Scope not found."
+    return None, "Multiple scopes match that name. Use the scope id."
+
+
+def _ensure_milestone_container(
+    user: Dict[str, Any],
+    goal_id: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    skills = user.setdefault("skills", {})
+    stages = user.setdefault("stages", {})
+    goals = user.setdefault("goals", {})
+    goal = goals.get(goal_id)
+
+    skill = None
+    for payload in skills.values():
+        if payload.get("goal_id") == goal_id and _normalize_text(payload.get("name", "")) == "milestones":
+            skill = payload
+            break
+
+    if not skill:
+        skill = new_skill(goal_id, "Milestones", "Auto-created for goal milestones")
+        skills[skill["id"]] = skill
+        if isinstance(goal, dict):
+            goal.setdefault("skill_ids", []).append(skill["id"])
+
+    stage = None
+    for payload in stages.values():
+        if payload.get("skill_id") == skill["id"] and _normalize_text(payload.get("name", "")) == "milestones":
+            stage = payload
+            break
+
+    if not stage:
+        stage = new_stage(skill["id"], "Milestones", "Auto-created for goal milestones")
+        stages[stage["id"]] = stage
+        skill.setdefault("stage_ids", []).append(stage["id"])
+
+    return skill, stage
+
+
+def _format_milestones_with_progress(user: Dict[str, Any]) -> str:
+    milestones = user.get("milestones", {})
+    if not milestones:
+        return "Milestones: (empty)"
+
+    lines = [f"Milestones ({len(milestones)}):"]
+    for milestone_id, payload in milestones.items():
+        if not isinstance(payload, dict):
+            lines.append(f"- {milestone_id}")
+            continue
+        name = payload.get("name", "")
+        percent = progress_for_milestone(user, milestone_id)
+        lines.append(f"- {milestone_id}: {name} ({int(round(percent))}%)")
+    return "\n".join(lines)
+
+
+def _format_tasks_for_scope(user: Dict[str, Any], scope_id: str) -> str:
+    scopes = user.get("scopes", {})
+    scope = scopes.get(scope_id)
+    if not isinstance(scope, dict):
+        return "Scope not found."
+
+    task_ids = scope.get("task_ids", [])
+    if not task_ids:
+        return f"Tasks for {scope_id}: (empty)"
+
+    scope_name = scope.get("name", "")
+    lines = [f"Tasks for {scope_id}: {scope_name}"]
+    lines.extend(_format_task_lines(user, task_ids))
+    return "\n".join(lines)
+
+
+def _format_tasks_grouped(user: Dict[str, Any]) -> str:
+    tasks = user.get("tasks", {})
+    if not tasks:
+        return "Tasks: (empty)"
+
+    scopes = user.get("scopes", {})
+    lines = ["Tasks:"]
+    has_any = False
+    for scope_id, scope in scopes.items():
+        if not isinstance(scope, dict):
+            continue
+        task_ids = scope.get("task_ids", [])
+        if not task_ids:
+            continue
+        has_any = True
+        scope_name = scope.get("name", "")
+        lines.append(f"{scope_id}: {scope_name}")
+        lines.extend(_format_task_lines(user, task_ids))
+
+    if not has_any:
+        return "Tasks: (empty)"
+    return "\n".join(lines)
+
+
+def _format_task_lines(user: Dict[str, Any], task_ids: List[str]) -> List[str]:
+    tasks = user.get("tasks", {})
+    lines: List[str] = []
+    for idx, task_id in enumerate(task_ids, start=1):
+        task = tasks.get(task_id)
+        if not isinstance(task, dict):
+            continue
+        name = task.get("name", "")
+        status = task.get("status", "")
+        lines.append(f"  #{idx} {name} ({status})")
+    return lines
+
+
+def _resolve_task_selector(
+    user: Dict[str, Any],
+    raw: str,
+) -> Tuple[str | None, str | None]:
+    raw = raw.strip()
+    if not raw:
+        return None, "Please provide a task id, or scope + task selector."
+
+    if "|" in raw:
+        scope_ref, selector = raw.split("|", 1)
+        scope_id, error = _resolve_scope_id(user, scope_ref.strip())
+        if error:
+            return None, error
+        return _resolve_task_in_scope(user, scope_id, selector.strip())
+
+    tasks = user.get("tasks", {})
+    if raw in tasks:
+        return raw, None
+
+    task_ids = list(tasks.keys())
+    task_id, error = _resolve_task_by_name(tasks, task_ids, raw, "all tasks")
+    if error:
+        if error.startswith("Multiple tasks"):
+            return None, "Multiple tasks match. Use /complete_task <scope_id> | <name or #index>."
+        return None, error
+    return task_id, None
+
+
+def _resolve_task_in_scope(
+    user: Dict[str, Any],
+    scope_id: str,
+    selector: str,
+) -> Tuple[str | None, str | None]:
+    scopes = user.get("scopes", {})
+    scope = scopes.get(scope_id)
+    if not isinstance(scope, dict):
+        return None, "Scope not found."
+
+    task_ids = scope.get("task_ids", [])
+    if not task_ids:
+        return None, "Scope has no tasks."
+
+    normalized = selector.lstrip("#").strip()
+    if normalized.isdigit():
+        index = int(normalized)
+        if index < 1 or index > len(task_ids):
+            return None, f"Task index out of range. Use 1-{len(task_ids)}."
+        return task_ids[index - 1], None
+
+    tasks = user.get("tasks", {})
+    return _resolve_task_by_name(tasks, task_ids, selector, f"scope {scope_id}")
+
+
+def _resolve_task_by_name(
+    tasks: Dict[str, Any],
+    task_ids: List[str],
+    selector: str,
+    label: str,
+) -> Tuple[str | None, str | None]:
+    selector_norm = _normalize_text(selector)
+    exact_matches = [
+        task_id
+        for task_id in task_ids
+        if _normalize_text(tasks.get(task_id, {}).get("name", "")) == selector_norm
+    ]
+    if len(exact_matches) == 1:
+        return exact_matches[0], None
+    if len(exact_matches) > 1:
+        return None, f"Multiple tasks named '{selector}' in {label}. Use #index."
+
+    partial_matches = [
+        task_id
+        for task_id in task_ids
+        if selector_norm in _normalize_text(tasks.get(task_id, {}).get("name", ""))
+    ]
+    if len(partial_matches) == 1:
+        return partial_matches[0], None
+    if len(partial_matches) > 1:
+        return None, f"Multiple tasks match '{selector}' in {label}. Use #index."
+
+    return None, f"Task '{selector}' not found in {label}."
+
+
+def _milestone_progress_for_task(user: Dict[str, Any], task: Dict[str, Any]) -> float | None:
+    scope_id = task.get("scope_id")
+    if not scope_id:
+        return None
+    scope = user.get("scopes", {}).get(scope_id)
+    if not isinstance(scope, dict):
+        return None
+    milestone_id = scope.get("milestone_id")
+    if not milestone_id:
+        return None
+    return progress_for_milestone(user, milestone_id)
+
+
+def _parse_tags(raw: str | None) -> List[str]:
+    if not raw:
+        return []
+    lowered = _normalize_text(raw)
+    if lowered in RESET_WORDS or lowered in REMOVE_WORDS:
+        return []
+    tags: List[str] = []
+    seen = set()
+    for part in raw.split(","):
+        tag = part.strip()
+        if not tag:
+            continue
+        key = _normalize_text(tag)
+        if key in seen:
+            continue
+        seen.add(key)
+        tags.append(tag)
+    return tags
+
+
+def _filter_insights(insights: Dict[str, Any], mode: str) -> List[Tuple[str, Dict[str, Any]]]:
+    items: List[Tuple[str, Dict[str, Any]]] = []
+    for insight_id, insight in insights.items():
+        if not isinstance(insight, dict):
+            continue
+        has_tags = bool(insight.get("tags"))
+        has_summary = bool(insight.get("summary"))
+
+        if mode == "all":
+            items.append((insight_id, insight))
+        elif mode == "untagged" and not has_tags:
+            items.append((insight_id, insight))
+        elif mode == "unsummarized" and not has_summary:
+            items.append((insight_id, insight))
+        elif mode == "pending" and (not has_tags or not has_summary):
+            items.append((insight_id, insight))
+
+    return sorted(items, key=lambda item: item[1].get("created_at", ""))
+
+
+def _format_insight_items(items: List[Tuple[str, Dict[str, Any]]], mode: str) -> str:
+    lines = [f"Insights ({mode}, {len(items)}):"]
+    for insight_id, insight in items:
+        lines.append(_format_insight_line(insight_id, insight))
+    return "\n".join(lines)
+
+
+def _format_insight_line(insight_id: str, insight: Dict[str, Any]) -> str:
+    text = _truncate_text(insight.get("text", ""), 80)
+    group = insight.get("group", "")
+    tags = insight.get("tags", [])
+    summary = insight.get("summary", "")
+
+    meta_parts = []
+    if group:
+        meta_parts.append(f"group={group}")
+    meta_parts.append("tags=" + (",".join(tags) if tags else "none"))
+    meta_parts.append("summary=" + ("ok" if summary else "missing"))
+
+    return f"- {insight_id}: {text} ({', '.join(meta_parts)})"
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    cleaned = " ".join(str(text).split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(0, limit - 3)] + "..."
 
 
 def _progress_for_entity(user: Dict[str, Any], entity_type: str, entity_id: str) -> float | None:

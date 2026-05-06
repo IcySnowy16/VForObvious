@@ -61,6 +61,7 @@ def new_user_data() -> Dict[str, Any]:
         "milestones": {},
         "scopes": {},
         "tasks": {},
+        "insights": {},
     }
 
 
@@ -177,4 +178,22 @@ def new_task(
         "created_at": now,
         "updated_at": now,
         "done_at": None,
+    }
+
+
+def new_insight(
+    text: str,
+    tags: list[str] | None = None,
+    group: str = "",
+    summary: str = "",
+) -> Dict[str, Any]:
+    now = now_iso()
+    return {
+        "id": make_id("insight"),
+        "text": text,
+        "summary": summary,
+        "tags": list(tags or []),
+        "group": group,
+        "created_at": now,
+        "updated_at": now,
     }
