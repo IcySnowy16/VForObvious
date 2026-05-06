@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Tuple
 
 from telegram import Update
@@ -54,7 +55,7 @@ HELP_TEXT = (
     "/start - Show help\n"
     "/ping - Health check\n"
     "/add_updates <text> - Log update requests\n"
-    "/add_goal <name> [| desc]\n"
+    "/add_goal <name> [| desc] [| milestone1 50%, milestone2 80%]\n"
     "/list_goals\n"
     "/add_skill <goal_id> <name> [| desc]\n"
     "/list_skills\n"
@@ -79,6 +80,7 @@ HELP_TEXT = (
     "/view_settings - Show current render settings\n\n"
     "Examples:\n"
     "/add_goal Learn Japanese | Long term goal\n"
+    "/add_goal Stress Management | Long term goal | Failure Mgmt 50%, Task Manager 80%\n"
     "/add_skill goal_123 Kana Recognition\n"
     "/add_task scope_123 Drill 10 mins | kind=task | weight=1\n"
     "/progress skill skill_123\n"
@@ -125,9 +127,11 @@ async def cmd_add_updates(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def cmd_add_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /add_goal <name> [| desc]")
+        await update.message.reply_text(
+            "Usage: /add_goal <name> [| desc] [| milestone1 50%, milestone2 80%]"
+        )
         return
-    name, description = _parse_name_desc(" ".join(context.args))
+    name, description, milestones = _parse_goal_with_milestones(" ".join(context.args))
     if not name:
         await update.message.reply_text("Please provide a name.")
         return
@@ -135,9 +139,33 @@ async def cmd_add_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     db, user = _load_user(update)
     goal = new_goal(name, description)
     user["goals"][goal["id"]] = goal
+
+    created_milestones = []
+    if milestones:
+        skill = new_skill(goal["id"], "Milestones", "Auto-created for multi-add")
+        user["skills"][skill["id"]] = skill
+        goal.setdefault("skill_ids", []).append(skill["id"])
+
+        stage = new_stage(skill["id"], "Milestones", "Auto-created for multi-add")
+        user["stages"][stage["id"]] = stage
+        skill.setdefault("stage_ids", []).append(stage["id"])
+
+        for item in milestones:
+            milestone = new_milestone(stage["id"], item["name"], item.get("description", ""))
+            if item.get("target_percent") is not None:
+                milestone["target_percent"] = item["target_percent"]
+            user["milestones"][milestone["id"]] = milestone
+            stage.setdefault("milestone_ids", []).append(milestone["id"])
+            created_milestones.append(milestone["id"])
+
+        touch(skill)
+        touch(stage)
+        touch(goal)
+
     touch(user)
     save_db(db)
-    await update.message.reply_text(f"Goal added: {goal['id']} - {goal['name']}")
+    suffix = f" (milestones: {len(created_milestones)})" if created_milestones else ""
+    await update.message.reply_text(f"Goal added: {goal['id']} - {goal['name']}{suffix}")
 
 
 async def cmd_list_goals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -762,6 +790,47 @@ def _parse_name_desc(raw: str) -> Tuple[str, str]:
         name, desc = raw.split("|", 1)
         return name.strip(), desc.strip()
     return raw.strip(), ""
+
+
+def _parse_goal_with_milestones(raw: str) -> Tuple[str, str, List[Dict[str, Any]]]:
+    parts = [part.strip() for part in raw.split("|") if part.strip()]
+    if not parts:
+        return "", "", []
+
+    name = parts[0]
+    description = parts[1] if len(parts) > 1 else ""
+    milestone_raw = " | ".join(parts[2:]) if len(parts) > 2 else ""
+    milestones = _parse_milestones_list(milestone_raw) if milestone_raw else []
+    return name, description, milestones
+
+
+def _parse_milestones_list(raw: str) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for entry in [part.strip() for part in raw.split(",") if part.strip()]:
+        name, percent = _extract_percent(entry)
+        if not name:
+            continue
+        payload: Dict[str, Any] = {"name": name}
+        if percent is not None:
+            payload["target_percent"] = percent
+            payload["description"] = f"Target: {percent}%"
+        items.append(payload)
+    return items
+
+
+def _extract_percent(text: str) -> Tuple[str, int | None]:
+    match = re.search(r"(\d{1,3})\s*%", text)
+    percent = None
+    if match:
+        try:
+            percent = int(match.group(1))
+        except ValueError:
+            percent = None
+        text = re.sub(r"\s*\d{1,3}\s*%", " ", text, count=1)
+    cleaned = " ".join(text.split())
+    if percent is not None:
+        percent = max(0, min(100, percent))
+    return cleaned, percent
 
 
 def _parse_name_kv(raw: str) -> Tuple[str, Dict[str, str]]:
