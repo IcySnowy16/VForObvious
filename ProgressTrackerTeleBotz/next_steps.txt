@@ -1,0 +1,32 @@
+What I want to learn next
+
+1) Run bot for Render (Web Service)
+- Root Directory: ProgressTrackerTeleBotz
+- Build Command: pip install -r requirements.txt
+- Start Command: python run_bot.py
+- Add env vars on Render (not .env): TELEGRAM_TOKEN, TIMEZONE, DATA_FILE
+- Health Check Path: /healthz (optional)
+- Web Service needs PORT listener (already added in run_bot.py)
+
+2) Pushing up to GitHub
+- git add ProgressTrackerTeleBotz
+- git commit -m "Add ProgressTrackerTeleBotz bot" --only ProgressTrackerTeleBotz
+- git pull --rebase --autostash origin main
+- git push -u origin main
+
+3) Multi-add shorthand
+- Example: Add Stress Management | Long term goal | Failure Management 50% (milestone 1), Task Manager 80% (milestone 2)
+- Goal: one command to create goal + milestones + default tasks
+
+4) Goal -> milestones helper
+- /goal_to_milestones <goal_id|goal_name> | Failure Mgmt 50%, Task Manager 80%
+
+5) Task completion without task ids
+- /list_tasks [scope_id] shows #index per scope
+- /complete_task <scope_id> | #2  (or task name)
+- /list_milestones now shows milestone progress percent
+
+6) Insights capture + review
+- /add_insight <text> [| tags=a,b | group=foo]
+- /list_insights [all|untagged|unsummarized|pending]
+- /update_insight <insight_id> [| text=... | summary=... | tags=a,b | group=...]
