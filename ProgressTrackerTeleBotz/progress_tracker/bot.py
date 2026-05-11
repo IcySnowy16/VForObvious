@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import io
+import json
 from pathlib import Path
 import re
+import shutil
 from typing import Any, Dict, List, Tuple
 
-from telegram import Update
+from telegram import InputFile, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -15,11 +18,13 @@ from telegram.ext import (
     filters,
 )
 
-from .config import get_token, load_env
+from .config import get_data_file, get_token, load_env
 from .models import (
     STATUS_DONE,
     TASK_KIND_EXPERIMENT,
     TASK_KIND_TASK,
+    default_reminders,
+    default_user_settings,
     new_goal,
     new_insight,
     new_milestone,
@@ -27,6 +32,7 @@ from .models import (
     new_skill,
     new_stage,
     new_task,
+    new_user_data,
     touch,
 )
 from .progress import (
@@ -50,6 +56,10 @@ SKIP_WORDS = {"skip", "later"}
 STATE_MILESTONE_POSITION = 1
 STATE_MILESTONE_EMOJI = 2
 STATE_MILESTONE_SYMBOLS = 3
+STATE_IMPORT_FILE = 4
+
+IMPORT_MAX_BYTES = 5 * 1024 * 1024
+EXPORT_SCHEMA_USER = "progress_tracker_user"
 
 HELP_TEXT = (
     "Commands:\n"
@@ -83,7 +93,9 @@ HELP_TEXT = (
     "/set_milestones <20,50,80|reset> - Quick milestone positions\n"
     "/set_symbols key=value ... - Override bar symbols\n"
     "/set_emoji key=value ... - Override bar emoji\n"
-    "/view_settings - Show current render settings\n\n"
+    "/view_settings - Show current render settings\n"
+    "/export_data [all] - Export JSON backup\n"
+    "/import_data [replace|merge] [all] - Import JSON backup\n\n"
     "Examples:\n"
     "/add_goal Learn Japanese | Long term goal\n"
     "/add_goal Stress Management | Long term goal | Failure Mgmt 50%, Task Manager 80%\n"
@@ -100,6 +112,8 @@ HELP_TEXT = (
     "/set_milestones 25,50,75\n"
     "/set_symbols done=[x] doing=[>] milestone=[*]\n"
     "/set_emoji done=OK doing=WORK milestone=STAR\n"
+    "/export_data\n"
+    "/import_data replace\n"
 )
 
 UPDATES_LOG = Path(__file__).resolve().parent.parent / "data" / "updates_log.jsonl"
@@ -573,6 +587,86 @@ async def cmd_update_insight(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(f"Insight updated: {insight_id} ({', '.join(updated)})")
 
 
+async def cmd_export_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    scope = _parse_import_export_scope(context.args)
+    db = load_db()
+
+    if scope == "all":
+        payload = db
+    else:
+        user = get_user_data(db, update.effective_chat.id, update.effective_user.id)
+        payload = _wrap_user_export(user)
+
+    raw = json.dumps(payload, indent=2, ensure_ascii=True)
+    buffer = io.BytesIO(raw.encode("utf-8"))
+    buffer.seek(0)
+    filename = _export_filename(scope, update)
+
+    await update.message.reply_document(
+        document=InputFile(buffer, filename=filename),
+        caption=f"Exported {scope} backup.",
+    )
+
+
+async def cmd_import_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    mode, scope = _parse_import_args(context.args)
+    context.user_data["import_setup"] = {"mode": mode, "scope": scope}
+
+    await update.message.reply_text(
+        "Send the JSON file to import now. "
+        f"Mode: {mode}. Scope: {scope}. Use /cancel to stop."
+    )
+    return STATE_IMPORT_FILE
+
+
+async def _receive_import_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    setup = context.user_data.get("import_setup")
+    if not setup:
+        await update.message.reply_text("Use /import_data first.")
+        return ConversationHandler.END
+
+    document = update.message.document if update.message else None
+    if not document:
+        await update.message.reply_text("Please send a JSON file.")
+        return STATE_IMPORT_FILE
+
+    if document.file_size and document.file_size > IMPORT_MAX_BYTES:
+        await update.message.reply_text("File is too large. Please send a smaller JSON file.")
+        return STATE_IMPORT_FILE
+
+    if not _is_json_document(document):
+        await update.message.reply_text("Only .json files are supported.")
+        return STATE_IMPORT_FILE
+
+    file = await document.get_file()
+    buffer = io.BytesIO()
+    await file.download_to_memory(out=buffer)
+    raw = buffer.getvalue()
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        await update.message.reply_text("File must be UTF-8 encoded JSON.")
+        return STATE_IMPORT_FILE
+    except json.JSONDecodeError as exc:
+        await update.message.reply_text(f"Invalid JSON: {exc}")
+        return STATE_IMPORT_FILE
+
+    db = load_db()
+    backup_path = _backup_data_file()
+    updated_db, message = _apply_import_payload(db, update, payload, setup["mode"], setup["scope"])
+    if updated_db is None:
+        await update.message.reply_text(message or "Import failed.")
+        return STATE_IMPORT_FILE
+
+    save_db(updated_db)
+    context.user_data.pop("import_setup", None)
+
+    backup_note = f" Backup: {backup_path.name}." if backup_path else ""
+    await update.message.reply_text(f"Import complete. {message or ''}{backup_note}")
+    return ConversationHandler.END
+
+
 async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) != 2:
         await update.message.reply_text(
@@ -734,7 +828,8 @@ async def cmd_view_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("milestone_setup", None)
-    await update.message.reply_text("Setup cancelled.")
+    context.user_data.pop("import_setup", None)
+    await update.message.reply_text("Operation cancelled.")
     return ConversationHandler.END
 
 
@@ -765,6 +860,16 @@ def build_application(token: str | None = None) -> Application:
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
 
+    import_flow = ConversationHandler(
+        entry_points=[CommandHandler("import_data", cmd_import_data)],
+        states={
+            STATE_IMPORT_FILE: [
+                MessageHandler(filters.Document.ALL, _receive_import_file),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+    )
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
@@ -787,8 +892,10 @@ def build_application(token: str | None = None) -> Application:
     app.add_handler(CommandHandler("add_insight", cmd_add_insight))
     app.add_handler(CommandHandler("list_insights", cmd_list_insights))
     app.add_handler(CommandHandler("update_insight", cmd_update_insight))
+    app.add_handler(CommandHandler("export_data", cmd_export_data))
     app.add_handler(CommandHandler("remind", cmd_remind))
     app.add_handler(milestone_flow)
+    app.add_handler(import_flow)
     app.add_handler(CommandHandler("set_symbols", cmd_set_symbols))
     app.add_handler(CommandHandler("set_emoji", cmd_set_emoji))
     app.add_handler(CommandHandler("view_settings", cmd_view_settings))
@@ -999,6 +1106,249 @@ def _append_update(entry: Dict[str, Any]) -> None:
 
 def _escape_json(text: str) -> str:
     return text.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ")
+
+
+def _parse_import_export_scope(args: List[str]) -> str:
+    for arg in args:
+        if arg.strip().lower() in {"all", "db", "full"}:
+            return "all"
+    return "user"
+
+
+def _parse_import_args(args: List[str]) -> Tuple[str, str]:
+    mode = "replace"
+    scope = "user"
+    for arg in args:
+        lowered = arg.strip().lower()
+        if lowered in {"merge", "replace"}:
+            mode = lowered
+        elif lowered in {"all", "db", "full"}:
+            scope = "all"
+    return mode, scope
+
+
+def _wrap_user_export(user: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "schema": EXPORT_SCHEMA_USER,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "user": user,
+    }
+
+
+def _export_filename(scope: str, update: Update) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    if scope == "all":
+        return f"progress_db_{stamp}.json"
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    return f"progress_user_{chat_id}_{user_id}_{stamp}.json"
+
+
+def _is_json_document(document: Any) -> bool:
+    name = (getattr(document, "file_name", "") or "").lower()
+    mime = (getattr(document, "mime_type", "") or "").lower()
+    return name.endswith(".json") or mime == "application/json"
+
+
+def _backup_data_file() -> Path | None:
+    data_file = get_data_file()
+    if not data_file.exists():
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    backup = data_file.with_name(f"{data_file.stem}.backup.{stamp}{data_file.suffix}")
+    try:
+        shutil.copy2(data_file, backup)
+    except OSError:
+        return None
+    return backup
+
+
+def _apply_import_payload(
+    db: Dict[str, Any],
+    update: Update,
+    payload: Any,
+    mode: str,
+    scope: str,
+) -> Tuple[Dict[str, Any] | None, str | None]:
+    if scope == "all":
+        incoming = _extract_db_payload(payload)
+        if incoming is None:
+            return None, "Expected full database JSON (with 'chats')."
+        incoming_db = _normalize_db_payload(incoming)
+        if mode == "replace":
+            return incoming_db, "Replaced full database."
+        return _merge_db_payload(db, incoming_db), "Merged into full database."
+
+    user_payload = _extract_user_payload(payload, update)
+    if not isinstance(user_payload, dict):
+        return None, "Expected user JSON data."
+
+    chat_key = str(update.effective_chat.id)
+    user_key = str(update.effective_user.id)
+    chat = db.setdefault("chats", {}).setdefault(chat_key, {"users": {}})
+    users = chat.setdefault("users", {})
+
+    if mode == "replace":
+        users[user_key] = _normalize_user_payload(user_payload)
+        return db, "Replaced user data."
+
+    existing = users.get(user_key, {})
+    users[user_key] = _merge_user_payload(existing, user_payload)
+    return db, "Merged user data."
+
+
+def _extract_db_payload(payload: Any) -> Dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    if "chats" in payload:
+        return payload
+    return None
+
+
+def _extract_user_payload(payload: Any, update: Update) -> Dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema") == EXPORT_SCHEMA_USER:
+        return payload.get("user") if isinstance(payload.get("user"), dict) else None
+    if "user" in payload and isinstance(payload.get("user"), dict):
+        return payload.get("user")
+    if "chats" in payload:
+        chat = payload.get("chats", {}).get(str(update.effective_chat.id))
+        if isinstance(chat, dict):
+            users = chat.get("users", {})
+            if isinstance(users, dict):
+                return users.get(str(update.effective_user.id))
+        return None
+    return payload
+
+
+def _normalize_user_payload(payload: Any, force_updated: bool = True) -> Dict[str, Any]:
+    base = new_user_data()
+    incoming = payload if isinstance(payload, dict) else {}
+    for key, value in incoming.items():
+        base[key] = value
+
+    settings = base.get("settings")
+    if not isinstance(settings, dict):
+        settings = {}
+    normalized_settings = default_user_settings()
+    normalized_settings.update(settings)
+    if not isinstance(normalized_settings.get("symbols"), dict):
+        normalized_settings["symbols"] = {}
+    if not isinstance(normalized_settings.get("emoji"), dict):
+        normalized_settings["emoji"] = {}
+    base["settings"] = normalized_settings
+
+    reminders = base.get("reminders")
+    normalized_reminders = _merge_reminders(default_reminders(), reminders)
+    base["reminders"] = normalized_reminders
+
+    for key in ["goals", "skills", "stages", "milestones", "scopes", "tasks", "insights"]:
+        if not isinstance(base.get(key), dict):
+            base[key] = {}
+
+    if force_updated:
+        base["updated_at"] = datetime.now(timezone.utc).isoformat()
+    else:
+        base.setdefault("updated_at", datetime.now(timezone.utc).isoformat())
+    base.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+    return base
+
+
+def _merge_user_payload(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    base = _normalize_user_payload(existing, force_updated=False)
+    inc = _normalize_user_payload(incoming, force_updated=False)
+
+    merged = dict(base)
+    merged_settings = dict(base.get("settings", {}))
+    inc_settings = inc.get("settings", {})
+    merged_settings.update(inc_settings)
+    merged_settings["symbols"] = {
+        **base.get("settings", {}).get("symbols", {}),
+        **inc_settings.get("symbols", {}),
+    }
+    merged_settings["emoji"] = {
+        **base.get("settings", {}).get("emoji", {}),
+        **inc_settings.get("emoji", {}),
+    }
+    merged["settings"] = merged_settings
+
+    merged["reminders"] = _merge_reminders(base.get("reminders", {}), inc.get("reminders", {}))
+
+    for key in ["goals", "skills", "stages", "milestones", "scopes", "tasks", "insights"]:
+        merged[key] = dict(base.get(key, {}))
+        merged[key].update(inc.get(key, {}))
+
+    merged["created_at"] = base.get("created_at") or inc.get("created_at")
+    merged["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return _normalize_user_payload(merged, force_updated=False)
+
+
+def _merge_reminders(base: Dict[str, Any], incoming: Any) -> Dict[str, Any]:
+    normalized = default_reminders()
+
+    if isinstance(base, dict):
+        for key, value in base.items():
+            if key in normalized and isinstance(value, dict):
+                normalized[key].update(value)
+            else:
+                normalized[key] = value
+
+    if isinstance(incoming, dict):
+        for key, value in incoming.items():
+            if key in normalized and isinstance(value, dict):
+                normalized[key].update(value)
+            else:
+                normalized[key] = value
+
+    return normalized
+
+
+def _normalize_db_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = dict(payload)
+    data.setdefault("version", 1)
+    data.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+    data.setdefault("updated_at", datetime.now(timezone.utc).isoformat())
+
+    chats = data.get("chats")
+    if not isinstance(chats, dict):
+        chats = {}
+
+    normalized_chats: Dict[str, Any] = {}
+    for chat_id, chat in chats.items():
+        if not isinstance(chat, dict):
+            normalized_chats[str(chat_id)] = {"users": {}}
+            continue
+        users = chat.get("users")
+        if not isinstance(users, dict):
+            users = {}
+        normalized_users = {
+            str(user_id): _normalize_user_payload(user_payload)
+            for user_id, user_payload in users.items()
+            if isinstance(user_payload, dict)
+        }
+        normalized_chats[str(chat_id)] = {"users": normalized_users}
+
+    data["chats"] = normalized_chats
+    return data
+
+
+def _merge_db_payload(base: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    base_db = _normalize_db_payload(base)
+    incoming_db = _normalize_db_payload(incoming)
+
+    for chat_id, chat in incoming_db.get("chats", {}).items():
+        dest_chat = base_db.setdefault("chats", {}).setdefault(chat_id, {"users": {}})
+        dest_users = dest_chat.setdefault("users", {})
+        users = chat.get("users", {}) if isinstance(chat, dict) else {}
+        for user_id, user_payload in users.items():
+            if user_id in dest_users:
+                dest_users[user_id] = _merge_user_payload(dest_users[user_id], user_payload)
+            else:
+                dest_users[user_id] = _normalize_user_payload(user_payload)
+
+    base_db["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return base_db
 
 
 def _parse_name_desc(raw: str) -> Tuple[str, str]:
