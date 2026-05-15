@@ -59,7 +59,6 @@ def new_user_data() -> Dict[str, Any]:
         "skills": {},
         "stages": {},
         "milestones": {},
-        "scopes": {},
         "tasks": {},
         "insights": {},
     }
@@ -137,32 +136,12 @@ def new_milestone(stage_id: str, name: str, description: str = "") -> Dict[str, 
         "status": STATUS_TODO,
         "created_at": now,
         "updated_at": now,
-        "scope_ids": [],
-    }
-
-
-def new_scope(
-    milestone_id: str,
-    name: str,
-    start_date: str = "",
-    end_date: str = "",
-) -> Dict[str, Any]:
-    now = now_iso()
-    return {
-        "id": make_id("scope"),
-        "milestone_id": milestone_id,
-        "name": name,
-        "start_date": start_date,
-        "end_date": end_date,
-        "status": STATUS_TODO,
-        "created_at": now,
-        "updated_at": now,
         "task_ids": [],
     }
 
 
 def new_task(
-    scope_id: str,
+    milestone_id: str,
     name: str,
     kind: str = TASK_KIND_TASK,
     weight: int = 1,
@@ -170,7 +149,7 @@ def new_task(
     now = now_iso()
     return {
         "id": make_id("task"),
-        "scope_id": scope_id,
+        "milestone_id": milestone_id,
         "name": name,
         "kind": kind,
         "weight": max(1, int(weight)),

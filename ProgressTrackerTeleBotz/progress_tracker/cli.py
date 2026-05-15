@@ -10,7 +10,6 @@ from .models import (
     ensure_user,
     new_goal,
     new_milestone,
-    new_scope,
     new_skill,
     new_stage,
     new_task,
@@ -19,7 +18,6 @@ from .models import (
 from .progress import (
     progress_for_goal,
     progress_for_milestone,
-    progress_for_scope,
     progress_for_skill,
     progress_for_stage,
     render_progress_block,
@@ -58,16 +56,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_milestone.add_argument("name")
     add_milestone.add_argument("--description", default="")
 
-    subparsers.add_parser("list-scopes")
-    add_scope = subparsers.add_parser("add-scope")
-    add_scope.add_argument("milestone_id")
-    add_scope.add_argument("name")
-    add_scope.add_argument("--start", default="")
-    add_scope.add_argument("--end", default="")
-
     subparsers.add_parser("list-tasks")
     add_task = subparsers.add_parser("add-task")
-    add_task.add_argument("scope_id")
+    add_task.add_argument("milestone_id")
     add_task.add_argument("name")
     add_task.add_argument("--kind", choices=["task", "experiment"], default="task")
     add_task.add_argument("--weight", type=int, default=1)
@@ -76,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     complete_task.add_argument("task_id")
 
     progress = subparsers.add_parser("progress")
-    progress.add_argument("entity_type", choices=["goal", "skill", "stage", "milestone", "scope"])
+    progress.add_argument("entity_type", choices=["goal", "skill", "stage", "milestone"])
     progress.add_argument("entity_id")
 
     return parser
@@ -143,32 +134,18 @@ def run(argv: List[str] | None = None) -> int:
         touch(user)
         save_db(db)
         _print_items("Milestones", user.get("milestones", {}))
-    elif args.command == "list-scopes":
-        _print_items("Scopes", user.get("scopes", {}))
-    elif args.command == "add-scope":
+    elif args.command == "list-tasks":
+        _print_items("Tasks", user.get("tasks", {}))
+    elif args.command == "add-task":
         milestone = user.get("milestones", {}).get(args.milestone_id)
         if not milestone:
             print("Milestone not found")
             return 1
-        scope = new_scope(args.milestone_id, args.name, args.start, args.end)
-        user["scopes"][scope["id"]] = scope
-        milestone.setdefault("scope_ids", []).append(scope["id"])
-        touch(milestone)
-        touch(user)
-        save_db(db)
-        _print_items("Scopes", user.get("scopes", {}))
-    elif args.command == "list-tasks":
-        _print_items("Tasks", user.get("tasks", {}))
-    elif args.command == "add-task":
-        scope = user.get("scopes", {}).get(args.scope_id)
-        if not scope:
-            print("Scope not found")
-            return 1
         kind = TASK_KIND_TASK if args.kind == "task" else TASK_KIND_EXPERIMENT
-        task = new_task(args.scope_id, args.name, kind, args.weight)
+        task = new_task(args.milestone_id, args.name, kind, args.weight)
         user["tasks"][task["id"]] = task
-        scope.setdefault("task_ids", []).append(task["id"])
-        touch(scope)
+        milestone.setdefault("task_ids", []).append(task["id"])
+        touch(milestone)
         touch(user)
         save_db(db)
         _print_items("Tasks", user.get("tasks", {}))
@@ -202,8 +179,6 @@ def _progress_for_entity(user: Dict[str, Any], entity_type: str, entity_id: str)
         return progress_for_stage(user, entity_id)
     if entity_type == "milestone":
         return progress_for_milestone(user, entity_id)
-    if entity_type == "scope":
-        return progress_for_scope(user, entity_id)
     return 0.0
 
 

@@ -20,7 +20,10 @@ from telegram.ext import (
 
 from .config import get_data_file, get_token, load_env
 from .models import (
+    STATUS_BLOCKED,
+    STATUS_DOING,
     STATUS_DONE,
+    STATUS_TODO,
     TASK_KIND_EXPERIMENT,
     TASK_KIND_TASK,
     default_reminders,
@@ -28,7 +31,6 @@ from .models import (
     new_goal,
     new_insight,
     new_milestone,
-    new_scope,
     new_skill,
     new_stage,
     new_task,
@@ -36,11 +38,12 @@ from .models import (
     touch,
 )
 from .progress import (
+    HIERARCHY,
     progress_for_goal,
     progress_for_milestone,
-    progress_for_scope,
     progress_for_skill,
     progress_for_stage,
+    progress_for_task_ids,
     render_progress_bar,
     render_progress_block,
     resolve_render_settings,
@@ -52,6 +55,49 @@ ALLOWED_SYMBOL_KEYS = {"done", "doing", "todo", "milestone", "sep"}
 RESET_WORDS = {"reset", "default", "clear"}
 REMOVE_WORDS = {"none", "remove", "off"}
 SKIP_WORDS = {"skip", "later"}
+
+INTERNAL_LEVELS = ["goal", "skill", "stage", "milestone", "task"]
+DEFAULT_LEVEL_ORDER = ["goal", "skill", "milestone", "task"]
+DEFAULT_LEVEL_LABELS = {
+    "goal": "goal",
+    "skill": "skill",
+    "stage": "stage",
+    "milestone": "milestone",
+    "task": "task",
+}
+MAX_LEVELS = 10
+
+STORE_BY_TYPE = {
+    "goal": "goals",
+    "skill": "skills",
+    "stage": "stages",
+    "milestone": "milestones",
+    "task": "tasks",
+}
+
+CHILDREN_KEY_BY_TYPE = {
+    "goal": "skill_ids",
+    "skill": "stage_ids",
+    "stage": "milestone_ids",
+    "milestone": "task_ids",
+}
+
+PARENT_META = {
+    "skill": ("goal", "goal_id", "skill_ids"),
+    "stage": ("skill", "skill_id", "stage_ids"),
+    "milestone": ("stage", "stage_id", "milestone_ids"),
+    "task": ("milestone", "milestone_id", "task_ids"),
+}
+
+LEVEL_KEY_ALIASES = {
+    "goals": "goal",
+    "skills": "skill",
+    "stages": "stage",
+    "milestones": "milestone",
+    "tasks": "task",
+    "experiment": "task",
+    "experiments": "task",
+}
 
 STATE_MILESTONE_POSITION = 1
 STATE_MILESTONE_EMOJI = 2
@@ -66,6 +112,12 @@ HELP_TEXT = (
     "/start - Show help\n"
     "/ping - Health check\n"
     "/add_updates <text> - Log update requests\n"
+    "/add <level> <name> [| to=<parent> | desc=...]\n"
+    "/edit <level> <id|name> | name=... | desc=... | status=... | to=<parent>\n"
+    "/delete <level> <id|name> [| cascade=false]\n"
+    "/set_levels 4=Goal 3=Skill 2=Milestone 1=Task\n"
+    "/view_levels\n"
+    "/list <level>\n"
     "/add_goal <name> [| desc] [| milestone1 50%, milestone2 80%]\n"
     "/goal_to_milestones <goal_id|goal_name> | milestone1 50%, milestone2 80%\n"
     "/list_goals\n"
@@ -75,13 +127,11 @@ HELP_TEXT = (
     "/list_stages\n"
     "/add_milestone <stage_id> <name> [| desc]\n"
     "/list_milestones\n"
-    "/add_scope <milestone_id> <name> [| start=YYYY-MM-DD | end=YYYY-MM-DD]\n"
-    "/list_scopes\n"
-    "/add_task <scope_id> <name> [| kind=task|experiment | weight=2]\n"
-    "/list_tasks [scope_id]\n"
+    "/add_task <milestone_id> <name> [| kind=task|experiment | weight=2]\n"
+    "/list_tasks [milestone_id]\n"
     "/complete_task <task_id>\n"
-    "/complete_task <scope_id> | <task name or #index>\n"
-    "/progress <goal|skill|stage|milestone|scope> <id>\n"
+    "/complete_task <milestone_id> | <task name or #index>\n"
+    "/progress <level> <id|name>\n"
     "/add_insight <text> [| tags=a,b | group=foo]\n"
     "/list_insights [all|untagged|unsummarized|pending]\n"
     "/update_insight <insight_id> [| text=... | summary=... | tags=a,b | group=...]\n"
@@ -100,10 +150,13 @@ HELP_TEXT = (
     "/add_goal Learn Japanese | Long term goal\n"
     "/add_goal Stress Management | Long term goal | Failure Mgmt 50%, Task Manager 80%\n"
     "/goal_to_milestones Stress Management | Failure Mgmt 50%, Task Manager 80%\n"
+    "/set_levels 4=Goal 3=Skill 2=Milestone 1=Task\n"
+    "/add goal Stress Management\n"
+    "/add skill Failure Management | to=Stress Management\n"
     "/add_skill goal_123 Kana Recognition\n"
-    "/add_task scope_123 Drill 10 mins | kind=task | weight=1\n"
-    "/list_tasks scope_123\n"
-    "/complete_task scope_123 | #2\n"
+    "/add_task milestone_123 Drill 10 mins | kind=task | weight=1\n"
+    "/list_tasks milestone_123\n"
+    "/complete_task milestone_123 | #2\n"
     "/add_insight Daily review felt rushed | tags=process,energy | group=weekly\n"
     "/progress skill skill_123\n"
     "/remind daily 20:00\n"
@@ -147,6 +200,245 @@ async def cmd_add_updates(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     }
     _append_update(entry)
     await update.message.reply_text("Saved. I will review and apply changes manually.")
+
+
+async def cmd_view_levels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _, user = _load_user(update)
+    settings = user.get("settings", {})
+    config = _get_level_config(settings)
+    await update.message.reply_text(_format_level_config(config))
+
+
+async def cmd_set_levels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /set_levels 5=Goal 4=Skill 3=Milestone 2=Experiment 1=Task"
+        )
+        return
+
+    db, user = _load_user(update)
+    settings = user.setdefault("settings", {})
+    config = _get_level_config(settings)
+
+    level_updates, label_updates, errors = _parse_level_assignments(context.args)
+    if errors:
+        await update.message.reply_text("Errors: " + "; ".join(errors))
+        return
+
+    order = list(config["order"])
+    labels = dict(config["labels"])
+    warnings: List[str] = []
+
+    for level, label in level_updates.items():
+        if level < 1 or level > len(order):
+            warnings.append(f"Level {level} is out of range (1-{len(order)}).")
+            continue
+        internal_type = order[len(order) - level]
+        if _is_clear_value(label):
+            labels[internal_type] = DEFAULT_LEVEL_LABELS.get(internal_type, internal_type)
+        else:
+            labels[internal_type] = label
+
+    for internal_type, label in label_updates.items():
+        if _is_clear_value(label):
+            labels[internal_type] = DEFAULT_LEVEL_LABELS.get(internal_type, internal_type)
+        else:
+            labels[internal_type] = label
+
+    settings["level_order"] = order
+    settings["level_labels"] = labels
+    touch(user)
+    save_db(db)
+
+    msg = _format_level_config(_get_level_config(settings))
+    if warnings:
+        msg += "\nWarnings:\n- " + "\n- ".join(warnings)
+    if len(order) > MAX_LEVELS:
+        msg += f"\nNote: Only the first {MAX_LEVELS} levels are active."
+    await update.message.reply_text(msg)
+
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /add <level> <name> [| to=<parent> | desc=...]"
+        )
+        return
+
+    raw = " ".join(context.args)
+    head, kv = _parse_name_kv(raw)
+    level_token, name = _split_level_name(head)
+    if not level_token or not name:
+        await update.message.reply_text(
+            "Usage: /add <level> <name> [| to=<parent> | desc=...]"
+        )
+        return
+
+    db, user = _load_user(update)
+    settings = user.get("settings", {})
+    config = _get_level_config(settings)
+    entity_type, error = _resolve_level_type(level_token, config)
+    if error:
+        await update.message.reply_text(error)
+        return
+
+    if entity_type == "task":
+        level_normalized = _normalize_text(level_token)
+        if level_normalized in {"experiment", "experiments"} and "kind" not in kv:
+            kv["kind"] = "experiment"
+
+    order = config["order"]
+    index = _index_in_order(order, entity_type)
+    if index is None:
+        await update.message.reply_text("Unknown level.")
+        return
+
+    parent_ref = kv.get("to") or kv.get("parent")
+    parent_type = None
+    parent_id = None
+
+    if index > 0:
+        if not parent_ref:
+            await update.message.reply_text("Please provide a parent via to=<name|id>.")
+            return
+        parent_type = order[index - 1]
+        parent_id, error = _resolve_entity_id(user, parent_type, parent_ref)
+        if error:
+            await update.message.reply_text(error)
+            return
+        parent_id, error = _ensure_parent_for_child(user, parent_type, parent_id, entity_type)
+        if error:
+            await update.message.reply_text(error)
+            return
+    elif parent_ref:
+        await update.message.reply_text("Top level items do not take a parent.")
+        return
+
+    entity_id = _create_entity(user, entity_type, parent_id, name, kv)
+    touch(user)
+    save_db(db)
+
+    label = _label_for_type(entity_type, config)
+    await update.message.reply_text(f"Added {label}: {entity_id} - {name}")
+
+
+async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /edit <level> <id|name> | name=... | desc=... | status=... | to=<parent>"
+        )
+        return
+
+    raw = " ".join(context.args)
+    head, kv = _parse_name_kv(raw)
+    level_token, selector = _split_level_name(head)
+    if not level_token or not selector:
+        await update.message.reply_text(
+            "Usage: /edit <level> <id|name> | name=... | desc=... | status=... | to=<parent>"
+        )
+        return
+
+    db, user = _load_user(update)
+    settings = user.get("settings", {})
+    config = _get_level_config(settings)
+    entity_type, error = _resolve_level_type(level_token, config)
+    if error:
+        await update.message.reply_text(error)
+        return
+
+    entity_id, error = _resolve_entity_id(user, entity_type, selector, include_hidden=True)
+    if error:
+        await update.message.reply_text(error)
+        return
+
+    store = user.get(_store_name(entity_type), {})
+    payload = store.get(entity_id)
+    if not isinstance(payload, dict):
+        await update.message.reply_text("Item not found.")
+        return
+
+    parent_ref = kv.get("to") or kv.get("parent")
+    moved = False
+    if parent_ref:
+        order = config.get("order", [])
+        index = _index_in_order(order, entity_type)
+        if index is None:
+            await update.message.reply_text("Unknown level.")
+            return
+        if index == 0:
+            await update.message.reply_text("Top level items do not take a parent.")
+            return
+        if _is_hidden(payload):
+            await update.message.reply_text("Auto-created items cannot be moved.")
+            return
+        parent_type = order[index - 1]
+        parent_id, error = _resolve_entity_id(user, parent_type, parent_ref)
+        if error:
+            await update.message.reply_text(error)
+            return
+        parent_id, error = _ensure_parent_for_child(user, parent_type, parent_id, entity_type)
+        if error:
+            await update.message.reply_text(error)
+            return
+        moved = _move_entity(user, entity_type, entity_id, parent_id)
+        if not moved:
+            await update.message.reply_text("Item is already under that parent.")
+            return
+
+    updated, errors = _apply_edit_updates(entity_type, payload, kv)
+    if errors:
+        await update.message.reply_text("Errors: " + "; ".join(errors))
+        return
+    if moved:
+        updated.append("parent")
+    if not updated:
+        await update.message.reply_text("No fields provided to update.")
+        return
+
+    touch(payload)
+    touch(user)
+    save_db(db)
+    await update.message.reply_text(f"Updated {entity_id}: {', '.join(updated)}")
+
+
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /delete <level> <id|name> [| cascade=false]")
+        return
+
+    raw = " ".join(context.args)
+    head, kv = _parse_name_kv(raw)
+    level_token, selector = _split_level_name(head)
+    if not level_token or not selector:
+        await update.message.reply_text("Usage: /delete <level> <id|name> [| cascade=false]")
+        return
+
+    db, user = _load_user(update)
+    settings = user.get("settings", {})
+    config = _get_level_config(settings)
+    entity_type, error = _resolve_level_type(level_token, config)
+    if error:
+        await update.message.reply_text(error)
+        return
+
+    entity_id, error = _resolve_entity_id(user, entity_type, selector, include_hidden=True)
+    if error:
+        await update.message.reply_text(error)
+        return
+
+    cascade = _parse_bool(kv.get("cascade", "true"))
+    if cascade is None:
+        await update.message.reply_text("Invalid cascade value. Use true or false.")
+        return
+
+    if not cascade and _has_children(user, entity_type, entity_id):
+        await update.message.reply_text("Item has children. Use cascade=true to delete.")
+        return
+
+    deleted_count = _delete_entity(user, entity_type, entity_id, cascade)
+    touch(user)
+    save_db(db)
+    await update.message.reply_text(f"Deleted {deleted_count} item(s).")
 
 
 async def cmd_add_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -361,10 +653,45 @@ async def cmd_list_milestones(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(msg)
 
 
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /list <level>")
+        return
+
+    level_token = context.args[0]
+    _, user = _load_user(update)
+    settings = user.get("settings", {})
+    config = _get_level_config(settings)
+    entity_type, error = _resolve_level_type(level_token, config)
+    if error:
+        await update.message.reply_text(error)
+        return
+
+    if entity_type == "milestone":
+        msg = _format_milestones_with_progress(user)
+    elif entity_type == "task":
+        msg = _format_tasks_grouped(user)
+    else:
+        title = _label_for_type(entity_type, config).title()
+        msg = _format_items(title, user.get(_store_name(entity_type), {}))
+
+    await update.message.reply_text(msg)
+
+
 async def cmd_add_scope(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Scope level was removed. Use /add_task <milestone_id> <name> instead."
+    )
+
+
+async def cmd_list_scopes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Scope level was removed. Use /list_tasks instead.")
+
+
+async def cmd_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) < 2:
         await update.message.reply_text(
-            "Usage: /add_scope <milestone_id> <name> [| start=YYYY-MM-DD | end=YYYY-MM-DD]"
+            "Usage: /add_task <milestone_id> <name> [| kind=task|experiment | weight=2]"
         )
         return
 
@@ -380,48 +707,14 @@ async def cmd_add_scope(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Milestone not found.")
         return
 
-    scope = new_scope(milestone_id, name, kv.get("start", ""), kv.get("end", ""))
-    user["scopes"][scope["id"]] = scope
-    milestone.setdefault("scope_ids", []).append(scope["id"])
-    touch(milestone)
-    touch(user)
-    save_db(db)
-    await update.message.reply_text(f"Scope added: {scope['id']} - {scope['name']}")
-
-
-async def cmd_list_scopes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _, user = _load_user(update)
-    msg = _format_items("Scopes", user.get("scopes", {}))
-    await update.message.reply_text(msg)
-
-
-async def cmd_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "Usage: /add_task <scope_id> <name> [| kind=task|experiment | weight=2]"
-        )
-        return
-
-    scope_id = context.args[0]
-    name, kv = _parse_name_kv(" ".join(context.args[1:]))
-    if not name:
-        await update.message.reply_text("Please provide a name.")
-        return
-
-    db, user = _load_user(update)
-    scope = user.get("scopes", {}).get(scope_id)
-    if not scope:
-        await update.message.reply_text("Scope not found.")
-        return
-
     kind_raw = (kv.get("kind") or "task").lower()
     kind = TASK_KIND_TASK if kind_raw != "experiment" else TASK_KIND_EXPERIMENT
     weight = _parse_int(kv.get("weight"), default=1)
 
-    task = new_task(scope_id, name, kind, weight)
+    task = new_task(milestone_id, name, kind, weight)
     user["tasks"][task["id"]] = task
-    scope.setdefault("task_ids", []).append(task["id"])
-    touch(scope)
+    milestone.setdefault("task_ids", []).append(task["id"])
+    touch(milestone)
     touch(user)
     save_db(db)
     await update.message.reply_text(f"Task added: {task['id']} - {task['name']}")
@@ -430,12 +723,12 @@ async def cmd_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _, user = _load_user(update)
     if context.args:
-        scope_ref = " ".join(context.args).strip()
-        scope_id, error = _resolve_scope_id(user, scope_ref)
+        milestone_ref = " ".join(context.args).strip()
+        milestone_id, error = _resolve_milestone_id(user, milestone_ref)
         if error:
             await update.message.reply_text(error)
             return
-        msg = _format_tasks_for_scope(user, scope_id)
+        msg = _format_tasks_for_milestone(user, milestone_id)
     else:
         msg = _format_tasks_grouped(user)
     await update.message.reply_text(msg)
@@ -444,7 +737,7 @@ async def cmd_list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def cmd_complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text(
-            "Usage: /complete_task <task_id> OR /complete_task <scope_id> | <task name or #index>"
+            "Usage: /complete_task <task_id> OR /complete_task <milestone_id> | <task name or #index>"
         )
         return
 
@@ -668,25 +961,31 @@ async def _receive_import_file(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if len(context.args) != 2:
-        await update.message.reply_text(
-            "Usage: /progress <goal|skill|stage|milestone|scope> <id>"
-        )
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /progress <level> <id|name>")
         return
 
-    entity_type = context.args[0].lower()
-    entity_id = context.args[1]
+    level_token = context.args[0]
+    selector = " ".join(context.args[1:]).strip()
+    if not selector:
+        await update.message.reply_text("Usage: /progress <level> <id|name>")
+        return
+
     db, user = _load_user(update)
-
-    percent = _progress_for_entity(user, entity_type, entity_id)
-    if percent is None:
-        await update.message.reply_text("Unknown entity type.")
+    settings = resolve_render_settings(user.get("settings", {}))
+    config = _get_level_config(user.get("settings", {}))
+    entity_type, error = _resolve_level_type(level_token, config)
+    if error:
+        await update.message.reply_text(error)
         return
 
-    settings = resolve_render_settings(user.get("settings", {}))
-    label = f"{entity_type}:{entity_id}"
-    block = render_progress_block(label, percent, settings)
-    await update.message.reply_text(block)
+    entity_id, error = _resolve_entity_id(user, entity_type, selector)
+    if error:
+        await update.message.reply_text(error)
+        return
+
+    msg = _format_progress_view(user, entity_type, entity_id, settings, config)
+    await update.message.reply_text(msg)
 
 
 async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -874,6 +1173,12 @@ def build_application(token: str | None = None) -> Application:
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("add_updates", cmd_add_updates))
+    app.add_handler(CommandHandler("view_levels", cmd_view_levels))
+    app.add_handler(CommandHandler("set_levels", cmd_set_levels))
+    app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("edit", cmd_edit))
+    app.add_handler(CommandHandler("delete", cmd_delete))
+    app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("add_goal", cmd_add_goal))
     app.add_handler(CommandHandler("goal_to_milestones", cmd_goal_to_milestones))
     app.add_handler(CommandHandler("list_goals", cmd_list_goals))
@@ -1108,6 +1413,588 @@ def _escape_json(text: str) -> str:
     return text.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ")
 
 
+def _is_hidden(payload: Any) -> bool:
+    return isinstance(payload, dict) and bool(payload.get("hidden"))
+
+
+def _store_name(entity_type: str) -> str:
+    return STORE_BY_TYPE.get(entity_type, "")
+
+
+def _children_key(entity_type: str) -> str:
+    return CHILDREN_KEY_BY_TYPE.get(entity_type, "")
+
+
+def _normalize_level_order(order: Any) -> List[str]:
+    if not isinstance(order, list):
+        order = list(DEFAULT_LEVEL_ORDER)
+    else:
+        has_task = "task" in order
+        remapped: List[str] = []
+        for item in order:
+            if item == "scope" and not has_task:
+                remapped.append("task")
+            else:
+                remapped.append(item)
+        order = remapped
+    cleaned = [item for item in order if item in INTERNAL_LEVELS]
+    ordered = [item for item in INTERNAL_LEVELS if item in cleaned]
+    return ordered or list(DEFAULT_LEVEL_ORDER)
+
+
+def _get_level_config(settings: Dict[str, Any]) -> Dict[str, Any]:
+    order = _normalize_level_order(settings.get("level_order"))
+    labels = dict(DEFAULT_LEVEL_LABELS)
+    stored_labels = settings.get("level_labels")
+    if isinstance(stored_labels, dict):
+        for key, value in stored_labels.items():
+            if key in INTERNAL_LEVELS and isinstance(value, str) and value.strip():
+                labels[key] = value.strip()
+        legacy_scope = stored_labels.get("scope")
+        if legacy_scope and "task" not in stored_labels:
+            labels["task"] = str(legacy_scope).strip()
+
+    label_to_type: Dict[str, str] = {}
+    for type_name, label in labels.items():
+        if label:
+            label_to_type[_normalize_text(label)] = type_name
+    for type_name in INTERNAL_LEVELS:
+        label_to_type[_normalize_text(type_name)] = type_name
+    for alias, internal in LEVEL_KEY_ALIASES.items():
+        label_to_type[_normalize_text(alias)] = internal
+
+    return {"order": order, "labels": labels, "label_to_type": label_to_type}
+
+
+def _label_for_type(entity_type: str, config: Dict[str, Any]) -> str:
+    labels = config.get("labels", {})
+    label = labels.get(entity_type)
+    return label if isinstance(label, str) and label.strip() else entity_type
+
+
+def _format_level_config(config: Dict[str, Any]) -> str:
+    order = config.get("order", [])
+    labels = config.get("labels", {})
+    if not order:
+        return "Levels: (empty)"
+    total = len(order)
+    lines = ["Levels (top -> bottom):"]
+    for idx, internal_type in enumerate(order):
+        level_num = total - idx
+        label = labels.get(internal_type, internal_type)
+        suffix = f" (type={internal_type})" if label != internal_type else ""
+        lines.append(f"L{level_num}: {label}{suffix}")
+    return "\n".join(lines)
+
+
+def _parse_level_assignments(args: List[str]) -> Tuple[Dict[int, str], Dict[str, str], List[str]]:
+    level_updates: Dict[int, str] = {}
+    label_updates: Dict[str, str] = {}
+    errors: List[str] = []
+
+    for arg in args:
+        if "=" not in arg:
+            errors.append(f"Missing '=' in {arg}")
+            continue
+        key, _, value = arg.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if not value:
+            errors.append(f"Empty value for {key}")
+            continue
+
+        if key.isdigit():
+            level_updates[int(key)] = value
+            continue
+
+        normalized = _normalize_text(key)
+        internal = LEVEL_KEY_ALIASES.get(normalized, normalized)
+        if internal in INTERNAL_LEVELS:
+            label_updates[internal] = value
+        else:
+            errors.append(f"Unknown level key {key}")
+
+    return level_updates, label_updates, errors
+
+
+def _resolve_level_type(token: str, config: Dict[str, Any]) -> Tuple[str | None, str | None]:
+    raw = _normalize_text(token)
+    if raw.startswith("lvl") and raw[3:].isdigit():
+        raw = raw[3:]
+
+    if raw.isdigit():
+        order = config.get("order", [])
+        level = int(raw)
+        if level < 1 or level > len(order):
+            return None, f"Level {level} is out of range (1-{len(order)})."
+        return order[len(order) - level], None
+
+    label_to_type = config.get("label_to_type", {})
+    if raw in label_to_type:
+        return label_to_type[raw], None
+
+    return None, f"Unknown level '{token}'. Use /view_levels to see configured levels."
+
+
+def _index_in_order(order: List[str], entity_type: str) -> int | None:
+    try:
+        return order.index(entity_type)
+    except ValueError:
+        return None
+
+
+def _split_level_name(raw: str) -> Tuple[str, str]:
+    parts = raw.strip().split(None, 1)
+    if len(parts) < 2:
+        return "", ""
+    return parts[0], parts[1].strip()
+
+
+def _parse_bool(raw: str | None) -> bool | None:
+    if raw is None:
+        return None
+    value = _normalize_text(str(raw))
+    if value in {"true", "yes", "1", "on"}:
+        return True
+    if value in {"false", "no", "0", "off"}:
+        return False
+    return None
+
+
+def _resolve_entity_id(
+    user: Dict[str, Any],
+    entity_type: str,
+    raw: str,
+    include_hidden: bool = False,
+) -> Tuple[str | None, str | None]:
+    store_name = _store_name(entity_type)
+    store = user.get(store_name, {})
+    if raw in store:
+        return raw, None
+
+    normalized = _normalize_text(raw)
+    matches = [
+        entity_id
+        for entity_id, payload in store.items()
+        if isinstance(payload, dict)
+        and (include_hidden or not _is_hidden(payload))
+        and _normalize_text(payload.get("name", "")) == normalized
+    ]
+    if len(matches) == 1:
+        return matches[0], None
+    if not matches:
+        return None, "Item not found."
+    return None, "Multiple items match that name. Use the id."
+
+
+def _apply_edit_updates(
+    entity_type: str,
+    payload: Dict[str, Any],
+    kv: Dict[str, str],
+) -> Tuple[List[str], List[str]]:
+    updated: List[str] = []
+    errors: List[str] = []
+    pending: Dict[str, Any] = {}
+
+    name = kv.get("name")
+    if name is not None:
+        pending["name"] = name
+        updated.append("name")
+
+    desc = kv.get("desc")
+    if desc is None:
+        desc = kv.get("description")
+    if desc is not None and entity_type in {"goal", "skill", "stage", "milestone"}:
+        if _is_clear_value(desc):
+            pending["description"] = ""
+        else:
+            pending["description"] = desc
+        updated.append("description")
+
+    status = kv.get("status")
+    if status is not None:
+        normalized = _normalize_text(status)
+        if normalized not in {STATUS_TODO, STATUS_DOING, STATUS_DONE, STATUS_BLOCKED}:
+            errors.append("Invalid status (use todo|doing|done|blocked)")
+        else:
+            pending["status"] = normalized
+            updated.append("status")
+
+    if entity_type == "task":
+        kind = kv.get("kind")
+        if kind is not None:
+            normalized = _normalize_text(kind)
+            if normalized not in {"task", "experiment"}:
+                errors.append("Invalid kind (task|experiment)")
+            else:
+                pending["kind"] = TASK_KIND_EXPERIMENT if normalized == "experiment" else TASK_KIND_TASK
+                updated.append("kind")
+        weight = kv.get("weight")
+        if weight is not None:
+            try:
+                parsed = int(weight)
+            except ValueError:
+                errors.append("Invalid weight (integer)")
+            else:
+                pending["weight"] = max(1, parsed)
+                updated.append("weight")
+
+    if entity_type == "milestone":
+        target = kv.get("target") or kv.get("target_percent") or kv.get("percent")
+        if target is not None:
+            if _is_clear_value(target):
+                pending["target_percent"] = None
+                updated.append("target_percent")
+            else:
+                try:
+                    parsed = int(target)
+                except ValueError:
+                    errors.append("Invalid target percent")
+                else:
+                    pending["target_percent"] = max(0, min(100, parsed))
+                    updated.append("target_percent")
+
+    if errors:
+        return [], errors
+
+    for key, value in pending.items():
+        payload[key] = value
+
+    return updated, errors
+
+
+def _is_clear_value(value: str) -> bool:
+    return _normalize_text(value) in RESET_WORDS or _normalize_text(value) in REMOVE_WORDS
+
+
+def _has_children(user: Dict[str, Any], entity_type: str, entity_id: str) -> bool:
+    key = _children_key(entity_type)
+    if not key:
+        return False
+    store = user.get(_store_name(entity_type), {})
+    payload = store.get(entity_id)
+    if not isinstance(payload, dict):
+        return False
+    child_ids = payload.get(key, [])
+    return isinstance(child_ids, list) and bool(child_ids)
+
+
+def _delete_entity(
+    user: Dict[str, Any],
+    entity_type: str,
+    entity_id: str,
+    cascade: bool,
+) -> int:
+    deleted = 0
+    store = user.get(_store_name(entity_type), {})
+    payload = store.get(entity_id)
+    if not isinstance(payload, dict):
+        return 0
+
+    if cascade:
+        for child_type, child_id in _collect_descendants(user, entity_type, entity_id):
+            child_store = user.get(_store_name(child_type), {})
+            if child_id in child_store:
+                del child_store[child_id]
+                deleted += 1
+
+    _detach_from_parent(user, entity_type, entity_id)
+    if entity_id in store:
+        del store[entity_id]
+        deleted += 1
+    return deleted
+
+
+def _collect_descendants(
+    user: Dict[str, Any],
+    entity_type: str,
+    entity_id: str,
+) -> List[Tuple[str, str]]:
+    mapping = HIERARCHY.get(entity_type)
+    if not mapping:
+        return []
+
+    store = user.get(mapping["store"], {})
+    payload = store.get(entity_id)
+    if not isinstance(payload, dict):
+        return []
+
+    child_ids = payload.get(mapping["children_key"], [])
+    if not isinstance(child_ids, list):
+        return []
+
+    child_type = mapping["child_type"]
+    results: List[Tuple[str, str]] = []
+    for child_id in child_ids:
+        results.extend(_collect_descendants(user, child_type, child_id))
+        results.append((child_type, child_id))
+    return results
+
+
+def _detach_from_parent(user: Dict[str, Any], entity_type: str, entity_id: str) -> None:
+    meta = PARENT_META.get(entity_type)
+    if not meta:
+        return
+    parent_type, parent_id_key, child_ids_key = meta
+    store = user.get(_store_name(entity_type), {})
+    payload = store.get(entity_id)
+    if not isinstance(payload, dict):
+        return
+    parent_id = payload.get(parent_id_key)
+    if not parent_id:
+        return
+    parent_store = user.get(_store_name(parent_type), {})
+    parent = parent_store.get(parent_id)
+    if not isinstance(parent, dict):
+        return
+    child_ids = parent.get(child_ids_key)
+    if isinstance(child_ids, list) and entity_id in child_ids:
+        child_ids.remove(entity_id)
+
+
+def _move_entity(
+    user: Dict[str, Any],
+    entity_type: str,
+    entity_id: str,
+    new_parent_id: str,
+) -> bool:
+    meta = PARENT_META.get(entity_type)
+    if not meta:
+        return False
+
+    parent_type, parent_id_key, child_ids_key = meta
+    store = user.get(_store_name(entity_type), {})
+    payload = store.get(entity_id)
+    if not isinstance(payload, dict):
+        return False
+
+    old_parent_id = payload.get(parent_id_key)
+    if old_parent_id == new_parent_id:
+        return False
+
+    _detach_from_parent(user, entity_type, entity_id)
+    payload[parent_id_key] = new_parent_id
+
+    parent_store = user.get(_store_name(parent_type), {})
+    parent = parent_store.get(new_parent_id)
+    if isinstance(parent, dict):
+        child_ids = parent.setdefault(child_ids_key, [])
+        if isinstance(child_ids, list) and entity_id not in child_ids:
+            child_ids.append(entity_id)
+        touch(parent)
+
+    return True
+
+
+def _ensure_parent_for_child(
+    user: Dict[str, Any],
+    parent_type: str,
+    parent_id: str,
+    child_type: str,
+) -> Tuple[str | None, str | None]:
+    parent_meta = PARENT_META.get(child_type)
+    if not parent_meta:
+        return parent_id, None
+    expected_parent = parent_meta[0]
+    if parent_type == expected_parent:
+        return parent_id, None
+
+    if parent_type not in INTERNAL_LEVELS or expected_parent not in INTERNAL_LEVELS:
+        return None, "Invalid parent chain."
+
+    start_idx = INTERNAL_LEVELS.index(parent_type)
+    end_idx = INTERNAL_LEVELS.index(expected_parent)
+    if start_idx > end_idx:
+        return None, "Parent level must be above the child level."
+
+    current_type = parent_type
+    current_id = parent_id
+    for next_type in INTERNAL_LEVELS[start_idx + 1 : end_idx + 1]:
+        current_id = _get_or_create_auto_child(user, current_type, current_id, next_type)
+        current_type = next_type
+
+    return current_id, None
+
+
+def _get_or_create_auto_child(
+    user: Dict[str, Any],
+    parent_type: str,
+    parent_id: str,
+    child_type: str,
+) -> str:
+    parent_store = user.get(_store_name(parent_type), {})
+    parent = parent_store.get(parent_id)
+    if not isinstance(parent, dict):
+        raise ValueError("Parent not found")
+
+    child_store = user.get(_store_name(child_type), {})
+    child_ids = parent.get(_children_key(parent_type), [])
+    if isinstance(child_ids, list):
+        for child_id in child_ids:
+            child = child_store.get(child_id)
+            if not isinstance(child, dict):
+                continue
+            if (
+                child.get("auto")
+                and child.get("auto_parent_id") == parent_id
+                and child.get("auto_child_type") == child_type
+            ):
+                return child_id
+
+    return _create_entity(
+        user,
+        child_type,
+        parent_id,
+        f"__auto__{child_type}",
+        {},
+        parent_type=parent_type,
+        is_auto=True,
+    )
+
+
+def _create_entity(
+    user: Dict[str, Any],
+    entity_type: str,
+    parent_id: str | None,
+    name: str,
+    kv: Dict[str, str],
+    parent_type: str | None = None,
+    is_auto: bool = False,
+) -> str:
+    description = kv.get("desc") or kv.get("description") or ""
+    if is_auto:
+        name = f"__auto__{entity_type}"
+        description = "Auto-created for level mapping."
+
+    store = user.setdefault(_store_name(entity_type), {})
+    item: Dict[str, Any]
+
+    if entity_type == "goal":
+        item = new_goal(name, description)
+    elif entity_type == "skill":
+        item = new_skill(parent_id or "", name, description)
+    elif entity_type == "stage":
+        item = new_stage(parent_id or "", name, description)
+    elif entity_type == "milestone":
+        item = new_milestone(parent_id or "", name, description)
+        target = kv.get("target") or kv.get("target_percent") or kv.get("percent")
+        if target and not _is_clear_value(target):
+            try:
+                parsed = int(target)
+            except ValueError:
+                parsed = None
+            if parsed is not None:
+                item["target_percent"] = max(0, min(100, parsed))
+    elif entity_type == "task":
+        kind_raw = _normalize_text(kv.get("kind", "task"))
+        kind = TASK_KIND_EXPERIMENT if kind_raw == "experiment" else TASK_KIND_TASK
+        weight = _parse_int(kv.get("weight"), default=1)
+        item = new_task(parent_id or "", name, kind, weight)
+    else:
+        raise ValueError("Unknown entity type")
+
+    if is_auto:
+        item["hidden"] = True
+        item["auto"] = True
+        item["auto_parent_id"] = parent_id
+        if parent_type:
+            item["auto_parent_type"] = parent_type
+        item["auto_child_type"] = entity_type
+
+    store[item["id"]] = item
+
+    if parent_id and not parent_type and entity_type in PARENT_META:
+        parent_type = PARENT_META[entity_type][0]
+
+    if parent_id and parent_type:
+        parent_store = user.get(_store_name(parent_type), {})
+        parent = parent_store.get(parent_id)
+        if isinstance(parent, dict):
+            child_ids = parent.setdefault(_children_key(parent_type), [])
+            if isinstance(child_ids, list):
+                child_ids.append(item["id"])
+            touch(parent)
+
+    return item["id"]
+
+
+def _format_progress_view(
+    user: Dict[str, Any],
+    entity_type: str,
+    entity_id: str,
+    settings: Dict[str, Any],
+    config: Dict[str, Any],
+) -> str:
+    label = _item_label(user, entity_type, entity_id, config)
+    percent = _progress_for_entity(user, entity_type, entity_id)
+    block = render_progress_block(label, percent or 0.0, settings)
+
+    order = config.get("order", [])
+    idx = _index_in_order(order, entity_type)
+    if idx is None or idx >= len(order) - 1:
+        return block
+
+    child_type = order[idx + 1]
+    child_ids = _collect_child_ids(user, entity_type, entity_id, child_type)
+    if not child_ids:
+        return block + f"\n\nNo {_label_for_type(child_type, config)} items yet."
+
+    lines = [block, f"{_label_for_type(child_type, config).title()}:"]
+    for child_id in child_ids:
+        child_label = _item_label(user, child_type, child_id, config)
+        child_percent = _progress_for_entity(user, child_type, child_id)
+        lines.append(render_progress_block(child_label, child_percent or 0.0, settings))
+    return "\n\n".join(lines)
+
+
+def _collect_child_ids(
+    user: Dict[str, Any],
+    start_type: str,
+    start_id: str,
+    target_type: str,
+) -> List[str]:
+    mapping = HIERARCHY.get(start_type)
+    if not mapping:
+        return []
+
+    store = user.get(mapping["store"], {})
+    payload = store.get(start_id)
+    if not isinstance(payload, dict):
+        return []
+
+    child_ids = payload.get(mapping["children_key"], [])
+    if not isinstance(child_ids, list):
+        return []
+
+    child_type = mapping["child_type"]
+    results: List[str] = []
+    for child_id in child_ids:
+        child_store = user.get(_store_name(child_type), {})
+        child = child_store.get(child_id)
+        if not isinstance(child, dict):
+            continue
+        if child_type == target_type:
+            if _is_hidden(child):
+                continue
+            results.append(child_id)
+        else:
+            results.extend(_collect_child_ids(user, child_type, child_id, target_type))
+    return results
+
+
+def _item_label(
+    user: Dict[str, Any],
+    entity_type: str,
+    entity_id: str,
+    config: Dict[str, Any],
+) -> str:
+    store = user.get(_store_name(entity_type), {})
+    payload = store.get(entity_id, {})
+    name = payload.get("name", entity_id) if isinstance(payload, dict) else entity_id
+    label = _label_for_type(entity_type, config).title()
+    return f"{label}: {name}"
+
+
 def _parse_import_export_scope(args: List[str]) -> str:
     for arg in args:
         if arg.strip().lower() in {"all", "db", "full"}:
@@ -1243,9 +2130,11 @@ def _normalize_user_payload(payload: Any, force_updated: bool = True) -> Dict[st
     normalized_reminders = _merge_reminders(default_reminders(), reminders)
     base["reminders"] = normalized_reminders
 
-    for key in ["goals", "skills", "stages", "milestones", "scopes", "tasks", "insights"]:
+    for key in ["goals", "skills", "stages", "milestones", "tasks", "insights"]:
         if not isinstance(base.get(key), dict):
             base[key] = {}
+
+    _migrate_scopes_payload(base)
 
     if force_updated:
         base["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -1275,7 +2164,7 @@ def _merge_user_payload(existing: Dict[str, Any], incoming: Dict[str, Any]) -> D
 
     merged["reminders"] = _merge_reminders(base.get("reminders", {}), inc.get("reminders", {}))
 
-    for key in ["goals", "skills", "stages", "milestones", "scopes", "tasks", "insights"]:
+    for key in ["goals", "skills", "stages", "milestones", "tasks", "insights"]:
         merged[key] = dict(base.get(key, {}))
         merged[key].update(inc.get(key, {}))
 
@@ -1331,6 +2220,81 @@ def _normalize_db_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     data["chats"] = normalized_chats
     return data
+
+
+def _migrate_scopes_payload(user: Dict[str, Any]) -> None:
+    scopes = user.get("scopes")
+    if not isinstance(scopes, dict) or not scopes:
+        user.pop("scopes", None)
+        return
+
+    milestones = user.get("milestones")
+    tasks = user.get("tasks")
+    if not isinstance(milestones, dict) or not isinstance(tasks, dict):
+        user.pop("scopes", None)
+        return
+
+    for scope in scopes.values():
+        if not isinstance(scope, dict):
+            continue
+        milestone_id = scope.get("milestone_id")
+        if not milestone_id:
+            continue
+        task_ids = scope.get("task_ids", [])
+        if not isinstance(task_ids, list):
+            continue
+        milestone = milestones.get(milestone_id)
+        if isinstance(milestone, dict):
+            milestone_task_ids = milestone.setdefault("task_ids", [])
+            if not isinstance(milestone_task_ids, list):
+                milestone_task_ids = []
+                milestone["task_ids"] = milestone_task_ids
+            for task_id in task_ids:
+                if task_id not in milestone_task_ids:
+                    milestone_task_ids.append(task_id)
+        for task_id in task_ids:
+            task = tasks.get(task_id)
+            if isinstance(task, dict):
+                task["milestone_id"] = milestone_id
+                task.pop("scope_id", None)
+
+    for task_id, task in tasks.items():
+        if not isinstance(task, dict):
+            continue
+        scope_id = task.get("scope_id")
+        if not scope_id:
+            continue
+        scope = scopes.get(scope_id)
+        if not isinstance(scope, dict):
+            continue
+        milestone_id = scope.get("milestone_id")
+        if not milestone_id:
+            continue
+        task["milestone_id"] = milestone_id
+        task.pop("scope_id", None)
+
+    for milestone in milestones.values():
+        if not isinstance(milestone, dict):
+            continue
+        task_ids = milestone.get("task_ids")
+        if not isinstance(task_ids, list):
+            milestone["task_ids"] = []
+        milestone.pop("scope_ids", None)
+
+    for task_id, task in tasks.items():
+        if not isinstance(task, dict):
+            continue
+        milestone_id = task.get("milestone_id")
+        if not milestone_id:
+            continue
+        milestone = milestones.get(milestone_id)
+        if not isinstance(milestone, dict):
+            continue
+        task_ids = milestone.setdefault("task_ids", [])
+        if isinstance(task_ids, list) and task_id not in task_ids:
+            task_ids.append(task_id)
+
+    user.pop("scopes", None)
 
 
 def _merge_db_payload(base: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
@@ -1433,11 +2397,16 @@ def _is_time_str(raw: str) -> bool:
 
 
 def _format_items(title: str, items: Dict[str, Any], include_status: bool = False) -> str:
-    if not items:
+    visible = [
+        (item_id, payload)
+        for item_id, payload in items.items()
+        if not _is_hidden(payload)
+    ]
+    if not visible:
         return f"{title}: (empty)"
 
-    lines = [f"{title} ({len(items)}):"]
-    for item_id, payload in items.items():
+    lines = [f"{title} ({len(visible)}):"]
+    for item_id, payload in visible:
         if not isinstance(payload, dict):
             lines.append(f"- {item_id}")
             continue
@@ -1468,20 +2437,20 @@ def _resolve_goal_id(user: Dict[str, Any], raw: str) -> Tuple[str | None, str | 
     return None, "Multiple goals match that name. Use the goal id."
 
 
-def _resolve_scope_id(user: Dict[str, Any], raw: str) -> Tuple[str | None, str | None]:
-    scopes = user.get("scopes", {})
-    if raw in scopes:
+def _resolve_milestone_id(user: Dict[str, Any], raw: str) -> Tuple[str | None, str | None]:
+    milestones = user.get("milestones", {})
+    if raw in milestones:
         return raw, None
     matches = [
-        scope_id
-        for scope_id, scope in scopes.items()
-        if _normalize_text(scope.get("name", "")) == _normalize_text(raw)
+        milestone_id
+        for milestone_id, milestone in milestones.items()
+        if _normalize_text(milestone.get("name", "")) == _normalize_text(raw)
     ]
     if len(matches) == 1:
         return matches[0], None
     if not matches:
-        return None, "Scope not found."
-    return None, "Multiple scopes match that name. Use the scope id."
+        return None, "Milestone not found."
+    return None, "Multiple milestones match that name. Use the milestone id."
 
 
 def _ensure_milestone_container(
@@ -1521,11 +2490,16 @@ def _ensure_milestone_container(
 
 def _format_milestones_with_progress(user: Dict[str, Any]) -> str:
     milestones = user.get("milestones", {})
-    if not milestones:
+    visible = {
+        milestone_id: payload
+        for milestone_id, payload in milestones.items()
+        if not _is_hidden(payload)
+    }
+    if not visible:
         return "Milestones: (empty)"
 
-    lines = [f"Milestones ({len(milestones)}):"]
-    for milestone_id, payload in milestones.items():
+    lines = [f"Milestones ({len(visible)}):"]
+    for milestone_id, payload in visible.items():
         if not isinstance(payload, dict):
             lines.append(f"- {milestone_id}")
             continue
@@ -1535,39 +2509,41 @@ def _format_milestones_with_progress(user: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _format_tasks_for_scope(user: Dict[str, Any], scope_id: str) -> str:
-    scopes = user.get("scopes", {})
-    scope = scopes.get(scope_id)
-    if not isinstance(scope, dict):
-        return "Scope not found."
+def _format_tasks_for_milestone(user: Dict[str, Any], milestone_id: str) -> str:
+    milestones = user.get("milestones", {})
+    milestone = milestones.get(milestone_id)
+    if not isinstance(milestone, dict):
+        return "Milestone not found."
 
-    task_ids = scope.get("task_ids", [])
+    task_ids = milestone.get("task_ids", [])
     if not task_ids:
-        return f"Tasks for {scope_id}: (empty)"
+        return f"Tasks for {milestone_id}: (empty)"
 
-    scope_name = scope.get("name", "")
-    lines = [f"Tasks for {scope_id}: {scope_name}"]
+    milestone_name = milestone.get("name", "")
+    lines = [f"Tasks for {milestone_id}: {milestone_name}"]
     lines.extend(_format_task_lines(user, task_ids))
     return "\n".join(lines)
 
 
 def _format_tasks_grouped(user: Dict[str, Any]) -> str:
     tasks = user.get("tasks", {})
-    if not tasks:
+    visible_tasks = {task_id: payload for task_id, payload in tasks.items() if not _is_hidden(payload)}
+    if not visible_tasks:
         return "Tasks: (empty)"
 
-    scopes = user.get("scopes", {})
+    milestones = user.get("milestones", {})
     lines = ["Tasks:"]
     has_any = False
-    for scope_id, scope in scopes.items():
-        if not isinstance(scope, dict):
+    for milestone_id, milestone in milestones.items():
+        if not isinstance(milestone, dict):
             continue
-        task_ids = scope.get("task_ids", [])
+        task_ids = milestone.get("task_ids", [])
+        task_ids = [task_id for task_id in task_ids if task_id in visible_tasks]
         if not task_ids:
             continue
         has_any = True
-        scope_name = scope.get("name", "")
-        lines.append(f"{scope_id}: {scope_name}")
+        milestone_name = milestone.get("name", "")
+        lines.append(f"{milestone_id}: {milestone_name}")
         lines.extend(_format_task_lines(user, task_ids))
 
     if not has_any:
@@ -1580,7 +2556,7 @@ def _format_task_lines(user: Dict[str, Any], task_ids: List[str]) -> List[str]:
     lines: List[str] = []
     for idx, task_id in enumerate(task_ids, start=1):
         task = tasks.get(task_id)
-        if not isinstance(task, dict):
+        if not isinstance(task, dict) or _is_hidden(task):
             continue
         name = task.get("name", "")
         status = task.get("status", "")
@@ -1594,14 +2570,14 @@ def _resolve_task_selector(
 ) -> Tuple[str | None, str | None]:
     raw = raw.strip()
     if not raw:
-        return None, "Please provide a task id, or scope + task selector."
+        return None, "Please provide a task id, or milestone + task selector."
 
     if "|" in raw:
         scope_ref, selector = raw.split("|", 1)
-        scope_id, error = _resolve_scope_id(user, scope_ref.strip())
+        scope_id, error = _resolve_milestone_id(user, scope_ref.strip())
         if error:
             return None, error
-        return _resolve_task_in_scope(user, scope_id, selector.strip())
+        return _resolve_task_in_milestone(user, scope_id, selector.strip())
 
     tasks = user.get("tasks", {})
     if raw in tasks:
@@ -1611,24 +2587,24 @@ def _resolve_task_selector(
     task_id, error = _resolve_task_by_name(tasks, task_ids, raw, "all tasks")
     if error:
         if error.startswith("Multiple tasks"):
-            return None, "Multiple tasks match. Use /complete_task <scope_id> | <name or #index>."
+            return None, "Multiple tasks match. Use /complete_task <milestone_id> | <name or #index>."
         return None, error
     return task_id, None
 
 
-def _resolve_task_in_scope(
+def _resolve_task_in_milestone(
     user: Dict[str, Any],
-    scope_id: str,
+    milestone_id: str,
     selector: str,
 ) -> Tuple[str | None, str | None]:
-    scopes = user.get("scopes", {})
-    scope = scopes.get(scope_id)
-    if not isinstance(scope, dict):
-        return None, "Scope not found."
+    milestones = user.get("milestones", {})
+    milestone = milestones.get(milestone_id)
+    if not isinstance(milestone, dict):
+        return None, "Milestone not found."
 
-    task_ids = scope.get("task_ids", [])
+    task_ids = milestone.get("task_ids", [])
     if not task_ids:
-        return None, "Scope has no tasks."
+        return None, "Milestone has no tasks."
 
     normalized = selector.lstrip("#").strip()
     if normalized.isdigit():
@@ -1638,7 +2614,7 @@ def _resolve_task_in_scope(
         return task_ids[index - 1], None
 
     tasks = user.get("tasks", {})
-    return _resolve_task_by_name(tasks, task_ids, selector, f"scope {scope_id}")
+    return _resolve_task_by_name(tasks, task_ids, selector, f"milestone {milestone_id}")
 
 
 def _resolve_task_by_name(
@@ -1672,13 +2648,7 @@ def _resolve_task_by_name(
 
 
 def _milestone_progress_for_task(user: Dict[str, Any], task: Dict[str, Any]) -> float | None:
-    scope_id = task.get("scope_id")
-    if not scope_id:
-        return None
-    scope = user.get("scopes", {}).get(scope_id)
-    if not isinstance(scope, dict):
-        return None
-    milestone_id = scope.get("milestone_id")
+    milestone_id = task.get("milestone_id")
     if not milestone_id:
         return None
     return progress_for_milestone(user, milestone_id)
@@ -1762,8 +2732,10 @@ def _progress_for_entity(user: Dict[str, Any], entity_type: str, entity_id: str)
         return progress_for_stage(user, entity_id)
     if entity_type == "milestone":
         return progress_for_milestone(user, entity_id)
-    if entity_type == "scope":
-        return progress_for_scope(user, entity_id)
+    if entity_type == "task":
+        tasks = user.get("tasks", {})
+        if entity_id in tasks:
+            return progress_for_task_ids(user, [entity_id])
     return None
 
 

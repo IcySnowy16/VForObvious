@@ -10,8 +10,7 @@ HIERARCHY = {
     "goal": {"store": "goals", "children_key": "skill_ids", "child_type": "skill"},
     "skill": {"store": "skills", "children_key": "stage_ids", "child_type": "stage"},
     "stage": {"store": "stages", "children_key": "milestone_ids", "child_type": "milestone"},
-    "milestone": {"store": "milestones", "children_key": "scope_ids", "child_type": "scope"},
-    "scope": {"store": "scopes", "children_key": "task_ids", "child_type": "task"},
+    "milestone": {"store": "milestones", "children_key": "task_ids", "child_type": "task"},
 }
 
 
@@ -223,11 +222,6 @@ def progress_for_stage(user_data: Dict[str, Any], stage_id: str) -> float:
 def progress_for_milestone(user_data: Dict[str, Any], milestone_id: str) -> float:
     calc = ProgressCalculator(user_data)
     return calc.progress_for("milestone", milestone_id)
-
-
-def progress_for_scope(user_data: Dict[str, Any], scope_id: str) -> float:
-    calc = ProgressCalculator(user_data)
-    return calc.progress_for("scope", scope_id)
 
 
 def progress_for_task_ids(user_data: Dict[str, Any], task_ids: Iterable[str]) -> float:
